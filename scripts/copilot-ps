@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tmux ペイン内で動作する GitHub Copilot CLI セッションを一覧表示する
+
+WATCH_INTERVAL=1
+NOTIFY=false
+
+SESSION_FILTER=""
+
+# 前回のペインステータスを保持する連想配列
+declare -A _PREV_STATUS
+
+# Colors and constants
+BOLD='\033[1m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+DIM='\033[2m'
+RESET='\033[0m'
+SEPARATOR=$(printf '%.0s─' {1..70})
+
+# 選択UI・フリーテキスト入力UI のナビゲーションヒントを検出する grep パターン
+_NAV_HINT_PATTERN='↑↓ to (navigate|select)|Enter to (select|confirm|submit)'
+
+# ヘルプメッセージを表示して終了する
+usage() {
+  cat <<EOF
+Usage:
+  copilot-ps [-w|--watch [INTERVAL]] [-n|--notify]  List Copilot sessions
+
+Options:
+  -w, --watch [SEC]   Watch mode (default: ${WATCH_INTERVAL}s interval)
+  -n, --notify        Send terminal notification on idle (iTerm2/Ghostty)
+  -h, --help          Show this help
+
+Examples:
+  copilot-ps -w
+  copilot-ps -w 5 --notify
+EOF
+  exit 0
+}
+
+# tmux の存在と TMUX セッション内での起動を確認する
+check_deps() {
+  if ! command -v tmux &>/dev/null; then
+    echo "error: tmux is not installed" >&2
+    exit 1
+  fi
+  if [[ -z "${TMUX:-}" ]]; then
+    echo "error: copilot-ps must be run inside a tmux session" >&2
+    exit 1
+  fi
+}
+
+# 現在の tmux セッション名を取得して SESSION_FILTER に設定する
+detect_current_session() {
+  SESSION_FILTER=$(tmux display-message -p '#S')
+}
+
+# リストモードのコマンドライン引数（-w/--watch など）を解析する
+parse_args() {
+  watch_mode=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -w|--watch)
+        watch_mode=true
+        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+          WATCH_INTERVAL="$2"
+          shift
+        fi
+        shift
+        ;;
+      -n|--notify) NOTIFY=true; shift ;;
+      -h|--help) usage ;;
+      *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+}
+
+# ペインが Copilot CLI を実行しているか判定する（copilot バイナリまたは node 経由）
+is_copilot_pane() {
+  local cmd="$1" pane_pid="$2"
+  [[ "$cmd" == "copilot" ]] && return 0
+  [[ "$cmd" == "node" ]] || return 1
+  local pids
+  pids=$(pgrep -P "$pane_pid" 2>/dev/null | tr '\n' ',' | sed 's/,$//' || true)
+  [[ -z "$pids" ]] && return 1
+  ps -o command= -p "$pids" 2>/dev/null | grep -q "copilot"
+}
+
+# 🤖 prefix = running, no prefix = idle
+title_status() { [[ "$1" == "🤖"* ]] && echo "running" || echo "idle"; }
+
+# ペイン内容 (stdin) からナビゲーションヒントの最終行番号を返す。ヒントがなければ空文字列を返す。
+_find_nav_line() {
+  grep -nE "$_NAV_HINT_PATTERN" | tail -1 | cut -d: -f1 || true
+}
+
+# タイトルに加えペイン内容を検査して正確なステータスを返す
+# Returns: running, idle, waiting_for_input
+pane_status() {
+  local pane_id="$1" title="$2"
+  local base
+  base=$(title_status "$title")
+
+  local content
+  content=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null)
+
+  # ナビゲーションヒントがあれば、タイトルに関わらず waiting_for_input の可能性を確認する
+  if printf '%s\n' "$content" | grep -qE "$_NAV_HINT_PATTERN"; then
+    local nav_line after_nav
+    nav_line=$(printf '%s\n' "$content" | _find_nav_line)
+    after_nav=$(printf '%s\n' "$content" | awk "NR > ${nav_line:-0}" \
+      | grep -cvE '^[[:space:]│╰╯─╭╮]*$' || true)
+    if (( after_nav == 0 )); then
+      echo "waiting_for_input"
+      return
+    fi
+  fi
+
+  echo "$base"
+}
+
+# ディレクトリパスを ~展開し、30文字超なら先頭省略する
+shorten_dir() {
+  local dir="${1/#$HOME/\~}"
+  [[ ${#dir} -gt 30 ]] && dir="...${dir: -27}"
+  echo "$dir"
+}
+
+# ペインタイトルからタスク文字列を取り出し最大 45 文字に切り詰める
+title_task() {
+  local task="${1#🤖}"
+  task="${task# }"
+  [[ ${#task} -gt 45 ]] && task="${task:0:42}..."
+  echo "$task"
+}
+
+# tmux 内の全ペインを走査して Copilot CLI セッションを検出し、ID・ステータス・タスク・ディレクトリを区切り文字付きで出力する
+get_list_copilot_panes() {
+  local -a panes_cmd
+  if [[ -n "$SESSION_FILTER" ]]; then
+    panes_cmd=(tmux list-panes -t "$SESSION_FILTER" -s -F)
+  else
+    panes_cmd=(tmux list-panes -a -F)
+  fi
+  while IFS='|' read -r pane_id cmd dir pane_pid title; do
+    is_copilot_pane "$cmd" "$pane_pid" || continue
+    local status task id_num
+    status=$(pane_status "$pane_id" "$title")
+    task=$(title_task "$title")
+    id_num="${pane_id#%}"
+    printf '%s\x1F%s\x1F%s\x1F%s\n' "$id_num" "$status" "$task" "$(shorten_dir "$dir")"
+  done < <("${panes_cmd[@]}" "#{pane_id}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}|#{pane_title}")
+}
+
+# Copilot ペインの一覧をヘッダー付きで整形して標準出力に表示する
+render() {
+  printf "${BOLD}  %5s  %-45s %s${RESET}\n" "ID" "TASK" "DIR"
+  [[ -n "$SESSION_FILTER" ]] && printf "${DIM}  session: %s${RESET}\n" "$SESSION_FILTER"
+  printf "%s\n" "$SEPARATOR"
+
+  local found=0
+  while IFS=$'\x1F' read -r id_num status task short_dir; do
+    found=$((found + 1))
+    local status_icon status_color
+    case "$status" in
+      running)           status_icon="●"; status_color="$GREEN" ;;
+      idle)              status_icon="○"; status_color="$YELLOW" ;;
+      waiting_for_input) status_icon=">"; status_color="$YELLOW" ;;
+      *)                 status_icon="?"; status_color="$DIM" ;;
+    esac
+    printf "${status_color}%s${RESET}  ${DIM}%5s${RESET}  %-45s ${DIM}%s${RESET}\n" \
+      "$status_icon" "$id_num" "$task" "$short_dir"
+  done < <(get_list_copilot_panes)
+  if [[ $found -eq 0 ]]; then
+    echo "No Copilot sessions found in tmux session: $SESSION_FILTER"
+  fi
+
+  printf "\n${DIM}Updated: $(date '+%H:%M:%S')${RESET}"
+}
+
+# ターミナル通知を送信する (iTerm2: OSC 9, Ghostty: osascript)
+send_notification() {
+  local title="$1" body="$2"
+  local term="${TERM_PROGRAM:-}"
+  case "$term" in
+    iTerm.app)
+      printf '\e]9;%s\a' "${title}: ${body}"
+      ;;
+    ghostty)
+      osascript -e "display notification \"${body}\" with title \"${title}\"" 2>/dev/null &
+      ;;
+    *)
+      # フォールバック: macOS なら osascript を使用
+      if [[ "$(uname)" == "Darwin" ]]; then
+        osascript -e "display notification \"${body}\" with title \"${title}\"" 2>/dev/null &
+      fi
+      ;;
+  esac
+}
+
+# ペインのステータス変化を検知して通知する
+check_and_notify() {
+  local id_num="$1" status="$2" task="$3"
+  local prev="${_PREV_STATUS[$id_num]:-}"
+  _PREV_STATUS[$id_num]="$status"
+
+  # running → idle/waiting_for_input への遷移時に通知
+  if [[ "$prev" == "running" && ("$status" == "idle" || "$status" == "waiting_for_input") ]]; then
+    local notify_task="${task:-Copilot session}"
+    [[ -z "$notify_task" ]] && notify_task="Pane %${id_num}"
+    if [[ "$status" == "waiting_for_input" ]]; then
+      send_notification "Copilot: 入力待ち" "$notify_task"
+    else
+      send_notification "Copilot: 完了" "$notify_task"
+    fi
+  fi
+}
+
+# 指定間隔で render を繰り返し画面を更新するウォッチモードのループ
+watch_loop() {
+  trap 'tput cnorm; tput clear; exit 0' INT TERM
+  trap 'tput clear' WINCH
+  tput civis
+  tput clear
+  while true; do
+    # 通知が有効なら各ペインのステータス変化を検知
+    if $NOTIFY; then
+      while IFS=$'\x1F' read -r id_num status task short_dir; do
+        check_and_notify "$id_num" "$status" "$task"
+      done < <(get_list_copilot_panes)
+    fi
+
+    local buf
+    buf=$(render)
+    tput home
+    local label="copilot-ps"
+    [[ -n "$SESSION_FILTER" ]] && label="copilot-ps [$SESSION_FILTER]"
+    printf "${DIM}${label}  (every ${WATCH_INTERVAL}s, Ctrl-C to stop)${RESET}\033[K\n\033[K\n"
+    printf '%s\033[K' "${buf//$'\n'/$'\033[K\n'}"
+    tput ed
+    sleep "$WATCH_INTERVAL"
+  done
+}
+
+# スクリプトのエントリーポイント：現在のセッションを検出してペイン一覧表示を実行する
+_copilot_ps_main() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
+  check_deps
+  detect_current_session
+  parse_args "$@"
+
+  if $watch_mode; then
+    watch_loop
+  else
+    render
+    echo
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  _copilot_ps_main "$@"
+fi

@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# tmux ペイン内の GitHub Copilot CLI セッションにメッセージを送信する
+
+MAX_MESSAGE_BYTES=102400
+WAIT_AFTER_PASTE="${COPILOT_PS_WAIT_AFTER_PASTE:-0.2}"
+SEND_BUFFER_NAME="copilot-send-$$"
+SESSION_FILTER=""
+
+# 選択UI・フリーテキスト入力UI のナビゲーションヒントを検出する grep パターン
+_NAV_HINT_PATTERN='↑↓ to (navigate|select)|Enter to (select|confirm|submit)'
+
+usage() {
+  cat <<EOF
+Usage:
+  copilot-send <id> [message] [flags]   Send a message to a session
+
+Options:
+  <id>                Target pane id as a plain number (e.g. 12), from the ID
+                      column shown by \`copilot-await\`. The '%' prefix is implicit.
+  [message]           Message body. If omitted, the body is read from stdin.
+                      Trailing newlines are always stripped. An empty body is
+                      rejected.
+  -h, --help          Show this help
+
+Examples:
+  copilot-send 12 "run the failing test once more"
+  make test 2>&1 | copilot-send 12
+  copilot-send 12 <<'EOF_BODY'
+  line one
+  line two
+  EOF_BODY
+
+Environment:
+  COPILOT_PS_WAIT_AFTER_PASTE   Seconds to wait between paste and Enter
+                                (default: 0.2)
+EOF
+  exit 0
+}
+
+check_deps() {
+  if ! command -v tmux &>/dev/null; then
+    echo "error: tmux is not installed" >&2
+    exit 1
+  fi
+  if [[ -z "${TMUX:-}" ]]; then
+    echo "error: copilot-send must be run inside a tmux session" >&2
+    exit 1
+  fi
+}
+
+# 現在の tmux セッション名を取得して SESSION_FILTER に設定する
+detect_current_session() {
+  SESSION_FILTER=$(tmux display-message -p '#S')
+}
+
+validate_session() {
+  if [[ -n "$SESSION_FILTER" ]]; then
+    if ! tmux has-session -t "$SESSION_FILTER" 2>/dev/null; then
+      echo "error: tmux session not found: $SESSION_FILTER" >&2
+      exit 1
+    fi
+  fi
+}
+
+# 指定 ID の tmux ペインが SESSION_FILTER のスコープ内に存在するか確認する
+pane_exists() {
+  if [[ -n "$SESSION_FILTER" ]]; then
+    tmux list-panes -s -t "$SESSION_FILTER" -F '#{pane_id}' | grep -qx "$1"
+  else
+    tmux list-panes -a -F '#{pane_id}' | grep -qx "$1"
+  fi
+}
+
+# 🤖 prefix = running, no prefix = idle
+title_status() { [[ "$1" == "🤖"* ]] && echo "running" || echo "idle"; }
+
+# ペイン内容 (stdin) からナビゲーションヒントの最終行番号を返す。ヒントがなければ空文字列を返す。
+_find_nav_line() {
+  grep -nE "$_NAV_HINT_PATTERN" | tail -1 | cut -d: -f1 || true
+}
+
+# タイトルに加えペイン内容を検査して正確なステータスを返す
+# Returns: running, idle, waiting_for_input
+pane_status() {
+  local pane_id="$1" title="$2"
+  local base
+  base=$(title_status "$title")
+  [[ "$base" != "running" ]] && { echo "$base"; return; }
+
+  local content
+  content=$(tmux capture-pane -t "$pane_id" -p 2>/dev/null)
+
+  if ! printf '%s\n' "$content" | grep -qE "$_NAV_HINT_PATTERN"; then
+    echo "running"
+    return
+  fi
+
+  local nav_line after_nav
+  nav_line=$(printf '%s\n' "$content" | _find_nav_line)
+  after_nav=$(printf '%s\n' "$content" | awk "NR > ${nav_line:-0}" \
+    | grep -cvE '^[[:space:]│╰╯─╭╮]*$' || true)
+
+  if (( after_nav == 0 )); then
+    echo "waiting_for_input"
+  else
+    echo "running"
+  fi
+}
+
+# 指定ペインにメッセージをペーストして Enter を送信する
+cmd_send() {
+  local id="" msg=""
+  local seen_id=false seen_body=false flags_done=false
+
+  while [[ $# -gt 0 ]]; do
+    if $flags_done; then
+      if ! $seen_id; then
+        id="$1"; seen_id=true
+      elif ! $seen_body; then
+        msg="$1"; seen_body=true
+      else
+        echo "send: too many positional arguments (expected: <id> [body])" >&2
+        return 1
+      fi
+      shift
+      continue
+    fi
+    case "$1" in
+      -h|--help)  usage ;;
+      --) flags_done=true; shift ;;
+      -*)
+        echo "send: unknown flag: $1" >&2
+        return 1
+        ;;
+      *)
+        if ! $seen_id; then
+          id="$1"; seen_id=true
+        elif ! $seen_body; then
+          msg="$1"; seen_body=true
+        else
+          echo "send: too many positional arguments (expected: <id> [body])" >&2
+          return 1
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if ! $seen_id; then
+    echo "send: missing <id>" >&2
+    return 1
+  fi
+  if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+    echo "send: id must be a plain number (e.g. 12), got: $id" >&2
+    return 1
+  fi
+  local target="%$id"
+
+  if ! $seen_body; then
+    if [[ -t 0 ]]; then
+      echo "send: stdin is a tty; pipe a message or pass it as an argument" >&2
+      return 1
+    fi
+    msg=$(head -c $((MAX_MESSAGE_BYTES + 1)))
+  fi
+
+  while [[ -n "$msg" && "${msg: -1}" == $'\n' ]]; do
+    msg="${msg%$'\n'}"
+  done
+
+  if [[ -z "$msg" ]]; then
+    echo "send: empty message" >&2
+    return 1
+  fi
+
+  local bytes
+  bytes=$(printf '%s' "$msg" | wc -c)
+  bytes="${bytes// /}"
+  if (( bytes > MAX_MESSAGE_BYTES )); then
+    echo "send: message too large: ${bytes} bytes > ${MAX_MESSAGE_BYTES} bytes" >&2
+    return 1
+  fi
+
+  if ! pane_exists "$target"; then
+    echo "send: pane $id not found" >&2
+    return 1
+  fi
+  local title
+  title=$(tmux display-message -t "$target" -p '#{pane_title}')
+
+  if [[ -n "${TMUX_PANE:-}" && "$TMUX_PANE" == "$target" ]]; then
+    echo "send: refusing to send to self ($target)" >&2
+    return 1
+  fi
+
+  local status
+  status=$(pane_status "$target" "$title")
+  if [[ "$status" != "idle" && "$status" != "waiting_for_input" ]]; then
+    echo "send: pane $id is not idle (status: $status)" >&2
+    return 1
+  fi
+
+  trap 'tmux delete-buffer -b "$SEND_BUFFER_NAME" 2>/dev/null || true' EXIT
+  if ! printf '%s' "$msg" | tmux load-buffer -b "$SEND_BUFFER_NAME" - 2>/dev/null; then
+    echo "send: failed to load tmux buffer" >&2
+    return 1
+  fi
+
+  if ! pane_exists "$target"; then
+    echo "send: pane $id disappeared before send" >&2
+    return 1
+  fi
+  local title2 status2
+  title2=$(tmux display-message -t "$target" -p '#{pane_title}')
+  status2=$(pane_status "$target" "$title2")
+  if [[ "$status2" != "idle" && "$status2" != "waiting_for_input" ]]; then
+    echo "send: pane $id became not idle before send (status: $status2); retry" >&2
+    return 1
+  fi
+
+  if ! tmux paste-buffer -b "$SEND_BUFFER_NAME" -d -t "$target" 2>/dev/null; then
+    echo "send: failed to paste into pane $id" >&2
+    return 1
+  fi
+  trap - EXIT
+
+  sleep "$WAIT_AFTER_PASTE"
+
+  if ! tmux send-keys -t "$target" Enter 2>/dev/null; then
+    echo "send: pane $id disappeared after paste — message was pasted but Enter was not sent; check the pane manually" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+# スクリプトのエントリーポイント
+_copilot_send_main() {
+  check_deps
+  detect_current_session
+  validate_session
+  cmd_send "$@"
+  exit $?
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  _copilot_send_main "$@"
+fi

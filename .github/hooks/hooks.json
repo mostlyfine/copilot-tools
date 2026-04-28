@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionEnd": [
+      {
+        "type": "command",
+        "bash": "~/.copilot/hooks/save-session-log.sh",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
