@@ -93,4 +93,5 @@ make test 2>&1 | copilot-send <id>  # 標準入力から送信
 
 | スキル | 概要 |
 |--------|------|
+| `simplify` | 変更コードをコード再利用・品質・効率の3視点で並列レビューし、問題を自動修正する Agent Skill |
 | `skill-creator` | Copilot 用カスタムスキルの新規作成・改修を行う Agent Skill |
