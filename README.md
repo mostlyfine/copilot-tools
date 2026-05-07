@@ -38,8 +38,11 @@ ghc "テストを実行して結果を教えて"
 `sessionEnd` フックにより、セッション終了時に会話ログが Markdown 形式で自動保存される。
 
 ```sh
+# フック設定をインストール（hooks.json を正しい場所にリンク）
+ln -sf "$(pwd)/.github/hooks/hooks.json" ~/.copilot/hooks.json
+
 # フックスクリプトをインストール
-cp .github/hooks/save-session-log.sh ~/.copilot/hooks/
+ln -sf "$(pwd)/.github/hooks/save-session-log.sh" ~/.copilot/hooks/save-session-log.sh
 
 # ログ保存先の変更（デフォルト: /tmp/copilot-logs）
 export COPILOT_LOG_DIR="$HOME/logs/copilot"
