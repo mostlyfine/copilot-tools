@@ -31,7 +31,8 @@
         "-y",
         "@modelcontextprotocol/server-filesystem",
         ".",
-        "~/src/"
+        "~/src/",
+        "~/.copilot/session-state/"
       ]
     }
   }
